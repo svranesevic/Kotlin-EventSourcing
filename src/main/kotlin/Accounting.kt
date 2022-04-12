@@ -1,11 +1,9 @@
-import arrow.core.Either
-import arrow.core.computations.either
-import arrow.core.left
-import arrow.core.right
+import Update.accept
+import Update.reject
+import arrow.core.NonEmptyList
+import arrow.core.ValidatedNel
 import java.math.BigDecimal
 import java.util.*
-
-typealias Error = String
 
 sealed interface Account
 object Uninitialized : Account {
@@ -24,70 +22,53 @@ data class OnlineAccountCreated(val accountId: UUID) : Event
 data class DepositMade(val accountId: UUID, val depositAmount: BigDecimal) : Event
 data class MoneyWithdrawn(val accountId: UUID, val withdrawalAmount: BigDecimal) : Event
 
+object AccountingDomain {
 
-data class EventStore(
-    val appendToStream: (String, Int, List<Event>) -> Either<Error, Unit>,
-    val readFromStream: (String) -> Either<Error, List<Event>>
-)
+    val decider =
+        object : Decider<Account, Command, Event, String> {
 
-object Domain {
+            override val initial: Account
+                get() = Uninitialized
 
-    fun apply(account: Account, event: Event): Account =
-        when {
-            account is Uninitialized && event is OnlineAccountCreated ->
-                OnlineAccount(event.accountId, BigDecimal.valueOf(0))
+            override fun apply(state: Account, event: Event): Account =
+                when {
+                    state is Uninitialized && event is OnlineAccountCreated ->
+                        OnlineAccount(event.accountId, BigDecimal.valueOf(0))
 
-            account is OnlineAccount && event is DepositMade ->
-                OnlineAccount(account.accountId, account.balance + event.depositAmount)
+                    state is OnlineAccount && event is DepositMade ->
+                        OnlineAccount(state.accountId, state.balance + event.depositAmount)
 
-            account is OnlineAccount && event is MoneyWithdrawn ->
-                OnlineAccount(account.accountId, account.balance - event.withdrawalAmount)
+                    state is OnlineAccount && event is MoneyWithdrawn ->
+                        OnlineAccount(state.accountId, state.balance - event.withdrawalAmount)
 
-            else -> account
+                    else -> state
+                }
+
+            override fun decide(command: Command, state: Account): ValidatedNel<String, NonEmptyList<Event>> =
+                when {
+                    state is Uninitialized && command is CreateOnlineAccount -> handleCreation(command)
+                    state is OnlineAccount -> decideOnlineAccount(command, state)
+                    else -> reject("invalid operation $command on current state $state")
+                }
         }
 
-    fun replay(initial: Account, events: List<Event>): Pair<Account, Int> =
-        events.fold(initial to -1) { (state, version), event ->
-            apply(state, event) to version + 1
-        }
+    private fun handleCreation(cmd: CreateOnlineAccount): ValidatedNel<String, NonEmptyList<Event>> =
+        accept(OnlineAccountCreated(cmd.accountId))
 
-    fun decide(cmd: Command, state: Account): Either<Error, List<Event>> =
-        when {
-            state is Uninitialized && cmd is CreateOnlineAccount -> handleCreation(cmd)
-            state is OnlineAccount -> decideOnlineAccount(cmd, state)
-            else -> "invalid operation $cmd on current state $state".left()
-        }
-
-    private fun handleCreation(cmd: CreateOnlineAccount): Either<Error, List<Event>> =
-        listOf(OnlineAccountCreated(cmd.accountId)).right()
-
-    private fun decideOnlineAccount(cmd: Command, state: OnlineAccount): Either<Error, List<Event>> =
+    private fun decideOnlineAccount(
+        cmd: Command,
+        state: OnlineAccount
+    ): ValidatedNel<String, NonEmptyList<Event>> =
         when (cmd) {
             is MakeDeposit ->
-                if (cmd.depositAmount <= BigDecimal.ZERO) "deposit amount must be positive".left()
-                else listOf(DepositMade(state.accountId, cmd.depositAmount)).right()
+                if (cmd.depositAmount <= BigDecimal.ZERO) reject("deposit amount must be positive")
+                else accept(DepositMade(state.accountId, cmd.depositAmount))
 
             is Withdraw ->
-                if (cmd.withdrawalAmount <= BigDecimal.ZERO) "withdrawal amount must be positive".left()
-                else if (state.balance - cmd.withdrawalAmount < BigDecimal.ZERO) "overdraft not allowed".left()
-                else listOf(MoneyWithdrawn(state.accountId, cmd.withdrawalAmount)).right()
+                if (cmd.withdrawalAmount <= BigDecimal.ZERO) reject("withdrawal amount must be positive")
+                else if (state.balance - cmd.withdrawalAmount < BigDecimal.ZERO) reject("overdraft not allowed")
+                else accept(MoneyWithdrawn(state.accountId, cmd.withdrawalAmount))
 
-            else -> "invalid operation $cmd on current state $state".left()
+            else -> reject("invalid operation $cmd on current state $state")
         }
-}
-
-object CommandHandling {
-
-    operator fun invoke(store: EventStore): suspend (UUID, Command) -> Either<Error, Unit> {
-        val handler: suspend (UUID, Command) -> Either<Error, Unit> = { id, cmd ->
-            either {
-                val events = store.readFromStream(id.toString()).bind()
-                val (state, version) = Domain.replay(Uninitialized, events)
-                val newEvents = Domain.decide(cmd, state).bind()
-                store.appendToStream(id.toString(), version, newEvents)
-            }
-        }
-
-        return handler
-    }
 }

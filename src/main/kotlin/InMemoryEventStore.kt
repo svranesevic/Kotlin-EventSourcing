@@ -1,22 +1,31 @@
 import arrow.core.Either
+import arrow.core.NonEmptyList
 import arrow.core.left
 import arrow.core.right
 
-object InMemoryEventStore {
+data class InMemoryEventStore<Event>(private var streams: Map<String, List<Pair<Event, Long>>> = mapOf()) :
+    EventStore<Event> {
 
-    private var streams: Map<String, List<Pair<Event, Int>>> = mapOf()
+    private fun getVersion(stream: List<Pair<Event, Long>>): Long = stream.maxOf { it.second }
 
-    private fun getVersion(stream: List<Pair<Event, Int>>): Int = stream.maxOf { it.second }
-
-    fun appendToStream(streamId: String, expectedVersion: Int, events: List<Event>): Either<Error, Unit> {
-        val stream = streams[streamId]
+    override fun appendToStream(
+        id: String,
+        expectedVersion: Long,
+        events: NonEmptyList<Event>
+    ): Either<EventStoreError, Unit> {
+        val stream = streams[id]
         val streamOrError =
-            if (stream == null && expectedVersion == -1) {
-                val newStream = listOf<Pair<Event, Int>>()
-                streams = streams + (streamId to newStream)
-                newStream.right()
-            } else if (stream != null && getVersion(stream) == expectedVersion) stream.right()
-            else "concurrency conflict".left()
+            if (stream == null) {
+                if (expectedVersion == -1L) {
+                    val newStream = listOf<Pair<Event, Long>>()
+                    streams = streams + (id to newStream)
+                    newStream.right()
+                } else EventStoreError.AggregateNotFound(id).left()
+            } else {
+                val streamVersion = getVersion(stream)
+                if (streamVersion == expectedVersion) stream.right()
+                else EventStoreError.ConcurrencyError(expectedVersion, streamVersion).left()
+            }
 
         val newEvents =
             events
@@ -25,10 +34,10 @@ object InMemoryEventStore {
 
         return streamOrError.map { existingEvents ->
             val allEvents = existingEvents + newEvents
-            streams = streams + (streamId to allEvents)
+            streams = streams + (id to allEvents)
         }
     }
 
-    fun readFromStream(streamId: String): Either<Error, List<Event>> =
-        (streams[streamId] ?: listOf()).sortedBy { it.second }.map { it.first }.right()
+    override fun readFromStream(id: String): List<Event> =
+        (streams[id] ?: listOf()).sortedBy { it.second }.map { it.first }
 }
